@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.ml.feature import VectorAssembler, StringIndexer, OneHotEncoder, StringIndexerModel
+from pyspark.ml.feature import VectorAssembler, StringIndexer, OneHotEncoder
 from pyspark.ml import Pipeline
 import numpy as np
 from pyspark.sql import functions as f
@@ -11,6 +11,7 @@ from ..utilities.utils import (
     dataframe_reader,
     log_decorator,
     HasConfigParam,
+    get_string_indexer_labels,
 )
 from ..inputs.transformers import VariableTransformer, IndicatorTransformer
 
@@ -46,6 +47,12 @@ class DataPreprocessing:
     @log_decorator
     def read_holidays(self, holidays_data_location):
         self.holidays_df = dataframe_reader(holidays_data_location, self.spark)
+
+        # Cast the calendar_date column to type 'date'
+        self.holidays_df = self.holidays_df.withColumn(
+            "calendar_date", f.col("calendar_date").cast("date")
+        )
+
         # Make sure the holiday columns are all integer
         for column_name in self.holiday_features:
             self.holidays_df = self.holidays_df.withColumn(
@@ -55,10 +62,14 @@ class DataPreprocessing:
     @log_decorator
     def read_raw_data(self, raw_data_location):
         mla_training_data = dataframe_reader(raw_data_location, self.spark)
+
+        # Convert timestamp and then extract only the date component
         mla_training_data = mla_training_data.withColumn(
             "date", (f.col("conversionTimestamp") / 1000).cast("timestamp")
         )
         mla_training_data = mla_training_data.withColumn("date", f.col("date").cast("date"))
+
+        # Join with holidays_df using only the date component
         joined_df = mla_training_data.join(
             broadcast(self.holidays_df),
             mla_training_data.date == self.holidays_df.calendar_date,
@@ -82,16 +93,20 @@ class DataPreprocessing:
         joined_df.select(*self.cols_to_keep).cache()
         self.mla_training_data = joined_df
 
+    @property
     def get_processed_data(self):
         return self.mla_training_data
 
 
 class FeatureEngineering(HasConfigParam):
-    def __init__(self, data_preprocessor: DataPreprocessing, model_type, do_bucketize):
+    def __init__(
+        self, data_preprocessor: DataPreprocessing, model_type, do_bucketize, propensity_model_type
+    ):
         super().__init__()
         self.model_type = model_type
         self.do_bucketize = do_bucketize
         self.data_preprocessor = data_preprocessor
+        self.propensity_model_type = propensity_model_type
 
     @property
     def other_user_impression_features(self):
@@ -116,13 +131,37 @@ class FeatureEngineering(HasConfigParam):
 
     @property
     def get_features_list(self):
+        """
+        Get the list of features for the modeling pipeline.
+
+        This method constructs the feature list based on various attributes and configurations
+        of the `FeatureEngineering` class. Notably, if the propensity_model_type is set to "LogisticRegression",
+        it excludes the last day of the week feature. This is due to potential issues that may arise
+        when scoring datasets that include data for only a single day of the week.
+        Returns:
+        --------
+        list
+            A list containing the names of the features to be used in the modeling pipeline.
+
+        """
+        # If model type is "regression" or propensity mode type is "logistic regression",
+        # exclude the last day, otherwise include all
+        if self.model_type in ["regression", ("regression",)] or self.propensity_model_type in [
+            ("LogisticRegression",),
+            "LogisticRegression",
+        ]:
+            day_of_week_features_to_use = self.day_of_week_features[:-1]
+        else:
+            day_of_week_features_to_use = self.day_of_week_features
+
         features = (
             self.data_preprocessor.traffic_features
             + self.data_preprocessor.holiday_features
             + self.other_user_impression_features
             + self.customer_features
-            + self.day_of_week_features
+            + day_of_week_features_to_use
         )
+
         return (
             ["intercept"] + features + self.imp_features
             if self.model_type == "regression"
@@ -133,7 +172,7 @@ class FeatureEngineering(HasConfigParam):
     def create_day_of_week_stages():
         string_indexer = StringIndexer(inputCol="day_of_week", outputCol="day_of_week_indexed")
         one_hot_encoder = OneHotEncoder(
-            inputCols=["day_of_week_indexed"], outputCols=["day_of_week_dummy"], dropLast=True
+            inputCols=["day_of_week_indexed"], outputCols=["day_of_week_dummy"], dropLast=False
         )
         return [string_indexer, one_hot_encoder]
 
@@ -231,18 +270,13 @@ class FeatureEngineering(HasConfigParam):
     def get_featurization_pipeline(self):
         return self.featurization_pipeline
 
-    def get_string_indexer_labels(self):
-        stage = self.pipeline_model.stages[-2]
-
-        if isinstance(stage, StringIndexerModel):
-            return stage.labels
-        else:
-            raise ValueError(
-                "Expected stage to be a StringIndexerModel, but found a different type."
-            )
+    @property
+    def get_labels_list(self):
+        labels = get_string_indexer_labels(self.pipeline_model)
+        return labels
 
     def get_string_indexer_treatments_names(self):
-        labels = self.get_string_indexer_labels()
+        labels = self.get_labels_list
         treatments_names = [label for label in labels if label != "no_impression"]
         if treatments_names:
             return treatments_names

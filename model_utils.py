@@ -21,13 +21,13 @@ class ModelBuilder(HasConfigParam):
         return self.wildebeest_purchase_regression_model
 
     def build_doubly_robust_model(
-        self, features_list, marketing_features, labels, treatments_types
+        self, features_list, labels, treatments_types, propensity_model_type
     ):
         self.dre = WildebeestDoublyRobustEstimation(
             features_list=features_list,
-            marketing_features=marketing_features,
             labels=labels,
             treatments_types=treatments_types,
+            propensity_model_type=propensity_model_type,
         )
         return self.dre
 

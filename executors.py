@@ -4,7 +4,7 @@ import sys
 from pyspark import keyword_only
 from pyspark.ml.classification import RandomForestClassificationModel
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.types import FloatType
+from pyspark.sql.types import FloatType, ArrayType, DoubleType
 
 from .estimators.model_evaluators import WildebeestDREstimationUtils
 from .inputs.data_processing import (
@@ -18,8 +18,14 @@ from .utilities.utils import (
     dataframe_reader,
     HasConfigParam,
     generate_paths,
-    filter_by_range,
+    get_string_indexer_labels,
 )
+from pyspark.ml import PipelineModel
+from pyspark.ml.feature import VectorAssembler
+
+from pyspark.sql.functions import udf
+from concurrent.futures import ThreadPoolExecutor
+
 from pyspark.ml import Pipeline
 import pyspark.sql.functions as f
 
@@ -41,6 +47,7 @@ class BaseBuilder:
         holidays_data_location,
         model_type="",
         do_bucketize=False,
+        propensity_model_type="",
     ):
         self.data_preprocessor = DataPreprocessing()
         self.feature_engineer = None
@@ -49,6 +56,7 @@ class BaseBuilder:
         self.holidays_data_location = holidays_data_location
         self.model_type = model_type
         self.do_bucketize = do_bucketize
+        self.propensity_model_type = propensity_model_type
 
     def build_data_schema(self):
         self.data_preprocessor.read_data_schema(self.data_schema_location)
@@ -61,7 +69,7 @@ class BaseBuilder:
 
     def build_feature_engineer(self):
         self.feature_engineer = FeatureEngineering(
-            self.data_preprocessor, self.model_type, self.do_bucketize
+            self.data_preprocessor, self.model_type, self.do_bucketize, self.propensity_model_type
         )
         self.feature_engineer.create_featurization_pipeline()
         self.feature_engineer.create_featurized_data()
@@ -84,7 +92,8 @@ class WildebeestTrainingExecutorBuilder(BaseBuilder):
         s3_output_path,
         bucket,
         do_bucketize=False,
-        model_type="regression",
+        model_type="regression",  # OLS or DRE
+        propensity_model_type="LogisticRegression",  # RandomForest or LogisticRegression,
     ):
         BaseBuilder.__init__(
             self,
@@ -97,6 +106,7 @@ class WildebeestTrainingExecutorBuilder(BaseBuilder):
         self.s3_output_path = s3_output_path
         self.bucket = bucket
         self.model_trainer = None
+        self.propensity_model_type = propensity_model_type
 
     def build_model_trainer(self):
         self.model_trainer: ModelBuilder = ModelBuilder()
@@ -112,6 +122,7 @@ class WildebeestTrainingExecutor:
     def __init__(self, builder: WildebeestTrainingExecutorBuilder):
         self.model_type: str = builder.model_type
         self.s3_output_path: str = builder.s3_output_path
+        self.propensity_model_type: str = builder.propensity_model_type
         self.bucket = builder.bucket
         self.data_preprocessor: DataPreprocessing = builder.data_preprocessor
         self.feature_engineer: FeatureEngineering = builder.feature_engineer
@@ -120,17 +131,25 @@ class WildebeestTrainingExecutor:
     @log_decorator
     def run(self):
         featurization_pipeline = self.feature_engineer.featurization_pipeline
+        processed_data = self.data_preprocessor.get_processed_data
+        sampled_process_data = processed_data.sample(withReplacement=False, fraction=0.1, seed=1234)
         if self.model_type == "regression":
             (
                 wildebeest_purchase_regression_model,
                 wildebeest_purchase_regression_model_fitted,
             ) = self._train_regression_model()
             self._create_and_persist_scoring_pipeline(
-                featurization_pipeline, wildebeest_purchase_regression_model_fitted
+                featurization_pipeline=featurization_pipeline,
+                model=wildebeest_purchase_regression_model_fitted,
+                sampled_process_data=sampled_process_data,
             )
         else:
             wildebeest_dre_model, wildebeest_dre_model_fitted = self._train_doubly_robust_model()
-            self._create_and_persist_scoring_pipeline(featurization_pipeline, wildebeest_dre_model)
+            self._create_and_persist_scoring_pipeline(
+                featurization_pipeline=featurization_pipeline,
+                model=wildebeest_dre_model,
+                sampled_process_data=sampled_process_data,
+            )
 
     def _train_regression_model(self):
         wildebeest_purchase_regression_model = self.model_trainer.build_linear_model(
@@ -144,29 +163,33 @@ class WildebeestTrainingExecutor:
     def _train_doubly_robust_model(self):
         wildebeest_dre_model = self.model_trainer.build_doubly_robust_model(
             features_list=self.feature_engineer.get_features_list,
-            marketing_features=self.data_preprocessor.marketing_features,
-            labels=self.feature_engineer.get_string_indexer_labels(),
+            labels=self.feature_engineer.get_labels_list,
             treatments_types=self.feature_engineer.get_string_indexer_treatments_names(),
+            propensity_model_type=self.propensity_model_type,
         )
         wildebeest_dre_model_fitted = wildebeest_dre_model.fit(
             dataset=self.feature_engineer.featurized_data
         )
-        wildebeest_dre_model.save_models_to_s3(self.s3_output_path)
+        wildebeest_dre_model.save_all_trained_models_to_s3(self.s3_output_path)
         wildebeest_dre_model.save_test_data(self.s3_output_path)
         wildebeest_dre_model_fitted.save_model_artifact_to_s3(self.s3_output_path)
         return wildebeest_dre_model, wildebeest_dre_model_fitted
 
     @log_decorator
-    def _create_and_persist_scoring_pipeline(self, featurization_pipeline, model):
+    def _create_and_persist_scoring_pipeline(
+        self, featurization_pipeline, model, sampled_process_data
+    ):
         scoring_pipeline_creator = ScoringPipeline(self.s3_output_path)
         marketing_index = self.feature_engineer.get_marketing_index()
         if self.model_type == "dre":
             scoring_pipeline_creator.create_scoring_pipeline(
-                featurization_pipeline=featurization_pipeline
+                featurization_pipeline_model=featurization_pipeline,
+                sampled_process_data=sampled_process_data,
             )
         elif self.model_type == "regression":
             scoring_pipeline_creator.create_scoring_pipeline(
-                featurization_pipeline=featurization_pipeline,
+                featurization_pipeline_model=featurization_pipeline,
+                sampled_process_data=sampled_process_data,
                 marketing_index=marketing_index,
                 model=model,
             )
@@ -187,33 +210,58 @@ class WildebeestDoublyRobustScoringExecutor(BaseBuilder, HasConfigParam):
         super().__init__("", scoring_data_location, holiday_data_location, model_type, do_bucketize)
         HasConfigParam.__init__(self)
         self.spark = SparkSession.builder.getOrCreate()
+        self.sparse_to_dense_udf = udf(lambda v: v.toArray().tolist(), ArrayType(DoubleType()))
         self.second_element = f.udf(lambda v: float(v[1]), FloatType())
         # Assigning other attributes
         self.pipeline_data_location = pipeline_data_location
         self.model_base_path = model_base_path
         self.output_data_location = output_data_location
 
-        self.treatment_ada, self.treatment_aap = self.getTreatments
+        self.labels = []
         self.trained_models = {
             "propensity": None,
             "counterfactual": None,
-            "treatments": {self.treatment_ada: None, self.treatment_aap: None},
+            "treatments": {"ada": None, "aap": None},
         }
 
     @log_decorator
     def _build_score_data(self):
         self.build_data_preprocessor()
-        processed_data = self.data_preprocessor.get_processed_data()
+        processed_data = self.data_preprocessor.get_processed_data
         return processed_data
 
     @log_decorator
     def _read_pipeline_data(self):
-        scoring_pipeline = Pipeline.load(self.pipeline_data_location)
-        return scoring_pipeline
+        """Load the fitted pipeline model."""
+        scoring_pipeline_model = PipelineModel.load(self.pipeline_data_location)
+        return scoring_pipeline_model
+
+    def _get_feature_list(self):
+        """Retrieve the feature list from the featurization stages of the fitted pipeline model."""
+
+        # Load the fitted pipeline model
+        scoring_pipeline_model = self._read_pipeline_data()
+
+        # Get the featurization stages
+        featurization_stages = scoring_pipeline_model.stages
+
+        # Access the feature list from the VectorAssembler stage
+        vector_assembler_stage = [
+            stage for stage in featurization_stages if isinstance(stage, VectorAssembler)
+        ][0]
+        feature_list = vector_assembler_stage.getInputCols()
+
+        return feature_list
 
     @log_decorator
-    def _get_featurized_score_data(self, scoring_pipeline, processed_data):
-        featurized_score_data = scoring_pipeline.fit(processed_data).transform(processed_data)
+    def _get_propensity_treatment_labels(self, scoring_pipeline_model):
+        """Get all teh treatment classes/labels that propenity model was trained on."""
+        return get_string_indexer_labels(scoring_pipeline_model)
+
+    @log_decorator
+    def _get_featurized_score_data(self, scoring_pipeline_model, processed_data):
+        """Transform the processed data using the loaded pipeline model."""
+        featurized_score_data = scoring_pipeline_model.transform(processed_data)
         return featurized_score_data
 
     @log_decorator
@@ -240,58 +288,82 @@ class WildebeestDoublyRobustScoringExecutor(BaseBuilder, HasConfigParam):
     def _transform(model, data):
         return model.transform(data)
 
-    def _get_propensity_scores(self, model, dataset, treatment):
-        propensity_col_name = f"{treatment}_propensity_prob"
+    def _get_propensity_scores(self, model, dataset):
         dataset = self._transform(model, dataset)
         dataset = dataset.withColumn(
-            propensity_col_name,
-            self.second_element(dataset[f"{treatment}_propensity_prob"]),
+            "propensity_prob_dense", self.sparse_to_dense_udf(dataset["propensity_prob"])
         )
-        return filter_by_range(dataset=dataset, col_to_filter=propensity_col_name)
+        dataset = dataset.withColumn(
+            "propensity_rawPrediction_dense",
+            self.sparse_to_dense_udf(dataset["propensity_rawPrediction"]),
+        )
 
-    def _get_outcome_probability(self, model, dataset, treatment, outcome_type):
+        for i, label in enumerate(self.labels):
+            dataset = dataset.withColumn(
+                f"{label}_propensity_probability", dataset["propensity_prob_dense"][i]
+            )
+
+        for treatment in self.labels:
+            dataset = dataset.withColumn(
+                f"normalized_{treatment}_propensity_probability",
+                dataset[f"{treatment}_propensity_probability"],
+            )
+
+        return dataset  # truncate_propensity_scores(dataset, labels=self.labels)
+
+    def _get_counterfactual_probability(self, model, dataset):
         dataset = self._transform(model, dataset)
         dataset = dataset.withColumn(
-            f"{treatment}_probability_{outcome_type}",
-            self.second_element(dataset[f"{treatment}_probability_outcome_{outcome_type}"]),
+            "probability_counterfactual",
+            self.second_element(dataset["probability_counterfactual"]),
         )
+        return dataset
 
+    def _get_outcome_probability(self, model, dataset, treatment_type):
+        dataset = self._transform(model, dataset)
+        probability_col_name = f"{treatment_type}_probability"
+        dataset = dataset.withColumn(
+            probability_col_name,
+            self.second_element(dataset[probability_col_name]),
+        )
         return dataset
 
     @log_decorator
     def _get_score_data(self, dataset: DataFrame):
         dataset.cache()
-        results = {}  # Store results for each treatment
-        for treatment, models in self.trained_models.items():
-            dataset = self._get_propensity_scores(models["propensity"], dataset, treatment)
-            dataset = self._get_outcome_probability(
-                models["treated"], dataset, treatment, outcome_type="treated"
-            )
-            dataset = self._get_outcome_probability(
-                models["untreated"], dataset, treatment, outcome_type="untreated"
-            )
+        dataset = self._get_propensity_scores(self.trained_models["propensity"], dataset)
+        dataset = self._get_counterfactual_probability(
+            self.trained_models["counterfactual"], dataset
+        )
 
-            # Do the evaluation, Compute lift, DRE, ATE, ATT
-            dre_utils = WildebeestDREstimationUtils()
+        dre_utils = WildebeestDREstimationUtils()
+
+        for treatment_type, model_type in self.trained_models["treatments"].items():
+            dataset = self._get_outcome_probability(
+                model_type, dataset, treatment_type=treatment_type
+            )
             dataset, ate_att_dict = dre_utils.compute_lift_and_dre(
-                dataset=dataset, treatment_type=treatment
+                dataset=dataset, treatment_type=treatment_type, perform_att_evaluations=False
             )
-        dataset.unpersist()
-        return results, dataset
 
-    def _process_Scored_data(self, dataset):
+        dataset.unpersist()
+        return dataset
+
+    def _process_scored_data(self, dataset):
         # Common columns that always need to be selected
         common_columns = [
-            "adCustomerOrderItemId",
             "adUserId",
             "conversionCurrency",
             "conversionOps",
             "conversionIndicator",
+            "treatment_type",
+            "treatment_type_indexed",
         ]
 
         selected_columns = common_columns.copy()
+        treatments = self.trained_models["treatments"].keys()
 
-        for treatment in self.trained_models.keys():
+        for treatment in treatments:
             treatment_columns = [col.name for col in dataset.schema.fields if treatment in col.name]
             selected_columns.extend(treatment_columns)
 
@@ -299,12 +371,9 @@ class WildebeestDoublyRobustScoringExecutor(BaseBuilder, HasConfigParam):
         final_dataset = dataset.select(*selected_columns)
 
         # Add new columns dynamically based on treatments
-        for treatment in self.trained_models.keys():
+        for treatment in treatments:
             final_dataset = final_dataset.withColumn(
-                f"miopsFromATE_{treatment.upper()}",
-                f.col(f"{treatment}_doubly_robust_estimate") * f.col("conversionOps"),
-            ).withColumn(
-                f"miopsFromLift_{treatment.upper()}",
+                f"miops_{treatment.upper()}",
                 f.col(f"{treatment}_lift") * f.col("conversionOps"),
             )
 
@@ -314,7 +383,6 @@ class WildebeestDoublyRobustScoringExecutor(BaseBuilder, HasConfigParam):
     def _persist_scored_data(
         self,
         final_dataset: DataFrame,
-        results_artifacts: {},
         output_path: str,
         file_format: str = "parquet",
     ) -> None:
@@ -329,16 +397,8 @@ class WildebeestDoublyRobustScoringExecutor(BaseBuilder, HasConfigParam):
             final_dataset.write.format(file_format).mode("overwrite").save(
                 f"{output_path}/scored_data/"
             )
-            spark = SparkSession.builder.appName("Save Scored Artifact").getOrCreate()
-            results_artifact_df = spark.createDataFrame(
-                [(k, v) for k, v in results_artifacts.items()], ["Key", "Value"]
-            )
-            # Write the DataFrame to the S3 location as a CSV file
-            results_artifact_df.coalesce(1).write.parquet(
-                f"{output_path}/model_artifact/", mode="overwrite"
-            )
             logger.info(
-                f"Final scored and results saved successfully to {output_path} in {file_format} format."
+                f"Final scored data saved successfully to {output_path} in {file_format} format."
             )
         except Exception as e:
             logger.error(f"Failed to save the final dataset. Error: {e}")
@@ -346,16 +406,35 @@ class WildebeestDoublyRobustScoringExecutor(BaseBuilder, HasConfigParam):
 
     def run_steps(self):
         processed_data = self._build_score_data()
+
+        # Repartitioning the data based on the default parallelism of the Spark context
+        num_partitions = self.spark.sparkContext.defaultParallelism
+        processed_data = processed_data.repartition(num_partitions)
+
         scoring_pipeline = self._read_pipeline_data()
-        featurized_data = self._get_featurized_score_data(scoring_pipeline, processed_data)
+        self.labels = self._get_propensity_treatment_labels(scoring_pipeline)
         self._load_models_from_s3()
-        result, scored_dataset = self._get_score_data(featurized_data)
-        final_dataset = self._process_Scored_data(dataset=scored_dataset)
+
+        # Create a ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # Submit jobs for parallel processing
+            future_featurized_data = executor.submit(
+                self._get_featurized_score_data, scoring_pipeline, processed_data
+            )
+            future_scored_data = executor.submit(
+                self._get_score_data, future_featurized_data.result()
+            )
+
+            # Retrieve the results once the parallel processing is completed
+            featurized_data = future_featurized_data.result()
+            scored_dataset = future_scored_data.result()
+
+        final_dataset = self._process_scored_data(dataset=scored_dataset)
         self._persist_scored_data(
             final_dataset=final_dataset,
-            results_artifacts=result,
             output_path=self.output_data_location,
         )
+        return final_dataset
 
 
 class WildebeestOLSScoringExecutor:

@@ -3,19 +3,8 @@ from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
 from pyspark.mllib.evaluation import MulticlassMetrics
 
 
-class SparkClassificationMetrics:
-    def __init__(
-        self,
-        dataset,
-        labelCol,
-        labels_list=None,
-        predictionCol="",
-        probabilityCol="",
-        rawPredictionCol="",
-    ):
-        if labels_list is None:
-            labels_list = []
-
+class SparkBinaryClassificationMetrics:
+    def __init__(self, dataset, labelCol, predictionCol, probabilityCol, rawPredictionCol):
         self.bc_valuator = None
         self.mc_valuator = None
         self.dataset = dataset
@@ -24,73 +13,18 @@ class SparkClassificationMetrics:
         self.probability_col = probabilityCol
         self.raw_prediction = rawPredictionCol
         self.metrics_dict = dict()
-        self.labels: [] = labels_list
         self.build_metrics_objects()
 
     def build_metrics_objects(self):
-        self.mc_valuator = MulticlassClassificationEvaluator(labelCol=self.label_col)
-        self.mc_valuator.setPredictionCol(self.prediction_col)
-        self.mc_valuator.setProbabilityCol(self.probability_col)
-
         # Instantiate evaluators
         self.bc_valuator = BinaryClassificationEvaluator(labelCol=self.label_col)
         self.bc_valuator.setRawPredictionCol(self.raw_prediction)
 
-    @property
-    def get_evaluator(self):
-        return self.mc_valuator
+        self.mc_valuator = MulticlassClassificationEvaluator(labelCol=self.label_col)
+        self.mc_valuator.setPredictionCol(self.prediction_col)
+        self.mc_valuator.setProbabilityCol(self.probability_col)
 
-    def get_class_metrics(self):
-        # Convert the dataset to RDD of (prediction, label) pairs
-        predictionAndLabels = self.dataset.select(self.prediction_col, self.label_col).rdd.map(
-            tuple
-        )
-
-        # Instantiate the MulticlassMetrics object
-        metrics = MulticlassMetrics(predictionAndLabels)
-        weighted_metrics = {
-            "weighted_recall": metrics.weightedRecall,
-            "weighted_precision": metrics.weightedPrecision,
-            "Weighted F(1) Score": metrics.weightedFMeasure(),
-        }
-        class_metrics = {}
-        for index, label in enumerate(self.labels):
-            class_metrics[f"class_{label}"] = {
-                "precision": metrics.precision(float(index)),
-                "recall": metrics.recall(float(index)),
-                "f1-score": metrics.fMeasure(float(index)),
-            }
-
-        return class_metrics, weighted_metrics
-
-    def get_multi_class_metrics(self):
-        metric_labels = ["accuracy", "f1", "precision", "recall"]
-        metricKeys = [f"{ml}" for ml in metric_labels]
-
-        acc = round(
-            self.mc_valuator.evaluate(self.dataset, {self.mc_valuator.metricName: "accuracy"}), 5
-        )
-        f1 = round(self.mc_valuator.evaluate(self.dataset, {self.mc_valuator.metricName: "f1"}), 5)
-        prec = round(
-            self.mc_valuator.evaluate(
-                self.dataset, {self.mc_valuator.metricName: "weightedPrecision"}
-            ),
-            5,
-        )
-        rec = round(
-            self.mc_valuator.evaluate(
-                self.dataset, {self.mc_valuator.metricName: "weightedRecall"}
-            ),
-            5,
-        )
-
-        metric_values_array = [acc, f1, prec, rec]
-
-        metrics_dictionary = dict(zip(metricKeys, metric_values_array))
-
-        return metrics_dictionary
-
-    def get_binary_metrics(self):
+    def get_metrics(self):
         metric_labels = ["area_roc", "area_prc", "accuracy", "f1", "precision", "recall"]
         metricKeys = [f"{ml}" for ml in metric_labels]
         # Capture metrics -> areas, acc, f1, prec, rec
@@ -126,6 +60,81 @@ class SparkClassificationMetrics:
         metrics_dictionary = dict(zip(metricKeys, metric_values_array))
 
         return metrics_dictionary
+
+
+class SparkMultiClassClassificationMetrics:
+    def __init__(
+        self, dataset, labelCol, labels_list, predictionCol, probabilityCol, rawPredictionCol
+    ):
+        self.bc_valuator = None
+        self.mc_valuator = None
+        self.dataset = dataset
+        self.label_col = labelCol
+        self.prediction_col = predictionCol
+        self.probability_col = probabilityCol
+        self.raw_prediction = rawPredictionCol
+        self.metrics_dict = dict()
+        self.build_metrics_objects()
+        self.labels: [] = labels_list
+
+    def build_metrics_objects(self):
+        self.mc_valuator = MulticlassClassificationEvaluator(labelCol=self.label_col)
+        self.mc_valuator.setPredictionCol(self.prediction_col)
+        self.mc_valuator.setProbabilityCol(self.probability_col)
+
+    @property
+    def get_evaluator(self):
+        return self.mc_valuator
+
+    def get_metrics(self):
+        metric_labels = ["accuracy", "f1", "precision", "recall"]
+        metricKeys = [f"{ml}" for ml in metric_labels]
+
+        acc = round(
+            self.mc_valuator.evaluate(self.dataset, {self.mc_valuator.metricName: "accuracy"}), 5
+        )
+        f1 = round(self.mc_valuator.evaluate(self.dataset, {self.mc_valuator.metricName: "f1"}), 5)
+        prec = round(
+            self.mc_valuator.evaluate(
+                self.dataset, {self.mc_valuator.metricName: "weightedPrecision"}
+            ),
+            5,
+        )
+        rec = round(
+            self.mc_valuator.evaluate(
+                self.dataset, {self.mc_valuator.metricName: "weightedRecall"}
+            ),
+            5,
+        )
+
+        metric_values_array = [acc, f1, prec, rec]
+
+        metrics_dictionary = dict(zip(metricKeys, metric_values_array))
+
+        return metrics_dictionary
+
+    def get_class_metrics(self):
+        # Convert the dataset to RDD of (prediction, label) pairs
+        predictionAndLabels = self.dataset.select(self.prediction_col, self.label_col).rdd.map(
+            tuple
+        )
+
+        # Instantiate the MulticlassMetrics object
+        metrics = MulticlassMetrics(predictionAndLabels)
+        weighted_metrics = {
+            "weighted_recall": metrics.weightedRecall,
+            "weighted_precision": metrics.weightedPrecision,
+            "Weighted F(1) Score": metrics.weightedFMeasure(),
+        }
+        class_metrics = {}
+        for index, label in enumerate(self.labels):
+            class_metrics[f"class_{label}"] = {
+                "precision": metrics.precision(float(index)),
+                "recall": metrics.recall(float(index)),
+                "f1-score": metrics.fMeasure(float(index)),
+            }
+
+        return class_metrics, weighted_metrics
 
 
 class CrossValidation:

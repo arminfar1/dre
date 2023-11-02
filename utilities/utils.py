@@ -1,4 +1,7 @@
+from typing import List
+
 import pyspark.sql.functions as f
+from pyspark.ml.feature import StringIndexerModel
 from pyspark.sql.types import FloatType
 from pyspark.ml.param import Param, Params, TypeConverters
 from pyspark.sql.functions import col, lit
@@ -15,8 +18,8 @@ import pandas as pd
 def get_config_param():
     # Now just hard coded. Could be imported from a JSON config file.
     return {
-        "treatments": {"aap_num_days": 14, "ada_num_days": 14},
-        "imp_threshold": 10,
+        "treatments": {"aap_num_days": 7, "ada_num_days": 7},
+        "imp_threshold": 20,
         "weight": True,
     }
 
@@ -61,11 +64,13 @@ def set_columns_to_zero(df, zero_features):
 
 def flatten_dict(d):
     """Flatten a nested dictionary."""
+
     def expand(key, value):
         if isinstance(value, dict):
-            return [(key + ' ' + k, v) for k, v in flatten_dict(value).items()]
+            return [(key + " " + k, v) for k, v in flatten_dict(value).items()]
         else:
             return [(key, value)]
+
     items = [item for k, v in d.items() for item in expand(k, v)]
     return dict(items)
 
@@ -195,16 +200,53 @@ def filter_by_range(dataset, col_to_filter, lower_bound=0.05, upper_bound=0.95):
     return dataset.filter((col(col_to_filter) >= lower_bound) & (col(col_to_filter) <= upper_bound))
 
 
+def truncate_propensity_scores(
+    dataset: DataFrame, labels: List[str], lower_bound=0.01, upper_bound=0.99
+):
+    """
+    Truncate propensity scores for the labels based on provided bounds.
+
+    Parameters:
+        dataset: dataframe to conduct the truncation on.
+        labels: List of columns to perform truncation on.
+        lower_bound: The lowest allowable bound.
+        upper_bound: The highest allowable bound.
+
+
+    Returns:
+        filtered DataFrames.
+    """
+    combined_filter = generate_combined_filter(labels, lower_bound, upper_bound)
+    dataset = dataset.filter(combined_filter)
+
+    return dataset
+
+
+def generate_combined_filter(labels: List[str], lower_bound=0.01, upper_bound=0.99) -> str:
+    """
+    Generate a combined filter expression for multiple labels based on provided bounds.
+
+    Parameters:
+        labels: List of labels.
+        lower_bound: The lowest allowable bound.
+        upper_bound: The highest allowable bound.
+
+    Returns:
+        Combined filter expression string.
+    """
+    filters = [
+        f"({treatment}_propensity_probability BETWEEN {lower_bound} AND {upper_bound})"
+        for treatment in labels
+    ]
+    combined_filter = " AND ".join(filters)
+
+    return combined_filter
+
+
 def winsorize_column(dataset, col_name, lower_quantile=0.01, upper_quantile=0.99):
     # Calculate the quantiles
     lower_bound, upper_bound = dataset.approxQuantile(
         col_name, [lower_quantile, upper_quantile], 0.01
-    )
-    print(
-        "winsorize_column lower_bound: ",
-        lower_bound,
-        " winsorize_column upper_bound: ",
-        upper_bound,
     )
     # Winsorize the column
     dataset = dataset.withColumn(
@@ -232,6 +274,24 @@ def set_columns_to_zeros(dataset, columns):
 def generate_paths(base, *path_components):
     """Generate model paths."""
     return f"{base}/{'/'.join(path_components)}/"
+
+
+def get_string_indexer_labels(pipeline_model):
+    """
+    Retrieves the labels (categories) used by the  stage of the given pipeline if it's a StringIndexerModel.
+    Parameters:
+        pipeline_model : pyspark.ml.PipelineModel
+        The pipeline model from which the labels are to be extracted.
+
+    Returns:
+        List of labels (categories) used by the StringIndexerModel.
+    """
+    stage = pipeline_model.stages[-2]
+
+    if isinstance(stage, StringIndexerModel):
+        return stage.labels
+    else:
+        raise ValueError("Expected stage to be a StringIndexerModel, but found a different type.")
 
 
 class HasConfigParam(Params):
