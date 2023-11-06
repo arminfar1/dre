@@ -17,6 +17,11 @@ from ..inputs.transformers import VariableTransformer, IndicatorTransformer
 
 
 class DataPreprocessing:
+    """
+    A class responsible for performing raw data preprocessing steps necessary before
+    building and engineering the features.
+    """
+
     def __init__(self):
         self.mla_training_data = None
         self.removed_holiday_feat_list = []
@@ -30,6 +35,12 @@ class DataPreprocessing:
 
     @log_decorator
     def read_data_schema(self, data_schema_location):
+        """
+        Read the data schema that contains all the required columns to build the features and
+        labels for machine learning tasks. If you need to add a new feature,
+        that feature should be included in this file.
+        It will create multiple lists contains holiday, traffic, marketing features, etc.
+        """
         mla_data_schema = read_json_from_s3(data_schema_location)
         self.mla_data_schema = mla_data_schema
         self.cols_to_keep = list(mla_data_schema[mla_data_schema.description != "other"].name)
@@ -46,6 +57,17 @@ class DataPreprocessing:
 
     @log_decorator
     def read_holidays(self, holidays_data_location):
+        """
+        This will the csv file that contains holidays. For now, I am ONLY using this file to extract
+        the day of the week which is used in my DRE model.
+        TODO: Currently, I am not using any holidays/amazon events in my feature.
+            We may need to do research on adding them
+
+        Parameters:
+            - holidays_data_location (str): path to the holiday file.
+        Returns:
+            None.
+        """
         self.holidays_df = dataframe_reader(holidays_data_location, self.spark)
 
         # Cast the calendar_date column to type 'date'
@@ -61,6 +83,15 @@ class DataPreprocessing:
 
     @log_decorator
     def read_raw_data(self, raw_data_location):
+        """
+        This method creates the raw training dataframe. It only selects the columns
+        that are required for training ML models.
+
+        Parameters:
+            - raw_data_location (str): path to the raw data files.
+        Returns:
+            None.
+        """
         mla_training_data = dataframe_reader(raw_data_location, self.spark)
 
         # Convert timestamp and then extract only the date component
@@ -99,9 +130,24 @@ class DataPreprocessing:
 
 
 class FeatureEngineering(HasConfigParam):
+    """
+    The class responsible for creating a feature set for modeling OLS or DRE methods.
+    It encapsulates the entire process of feature engineering including encoding, assembling
+    of features into a final dataset ready for machine learning models.
+    """
+
     def __init__(
         self, data_preprocessor: DataPreprocessing, model_type, do_bucketize, propensity_model_type
     ):
+        """
+        Initializes the FeatureEngineering class with the necessary preprocessing tools, model type, and configuration.
+
+        Parameters:
+            data_preprocessor (DataPreprocessing): An instance of processed raw data.
+            model_type (str): The type of model for which features are being engineered. OLS or DRE.
+            do_bucketize (bool): to determine if bucketization is needed as part of feature engineering.
+            propensity_model_type (str): The type of model to use for propensity score estimation. LR or RF.
+        """
         super().__init__()
         self.model_type = model_type
         self.do_bucketize = do_bucketize
@@ -170,6 +216,13 @@ class FeatureEngineering(HasConfigParam):
 
     @staticmethod
     def create_day_of_week_stages():
+        """
+        Static method to create transformation stages for day-of-week features,
+        including indexing and one-hot encoding.
+
+        Returns:
+            list: A list of PySpark pipeline stages for transforming day-of-week features.
+        """
         string_indexer = StringIndexer(inputCol="day_of_week", outputCol="day_of_week_indexed")
         one_hot_encoder = OneHotEncoder(
             inputCols=["day_of_week_indexed"], outputCols=["day_of_week_dummy"], dropLast=False
@@ -178,6 +231,13 @@ class FeatureEngineering(HasConfigParam):
 
     @staticmethod
     def create_user_feature_encoder():
+        """
+        Static method to create an encoder for user features, converting categorical
+        features to a vector of dummy variables.
+
+        Returns:
+            OneHotEncoder: A configured instance of OneHotEncoder for user features.
+        """
         return OneHotEncoder(
             inputCols=["customerPropensityBucket", "customerRfm_indexed"],
             outputCols=["customerPropensity_dummy", "customerRfm_dummy"],
@@ -185,6 +245,13 @@ class FeatureEngineering(HasConfigParam):
         )
 
     def create_encoder_stages(self):
+        """
+        Method to create encoder stages for treatment features, if bucketization is configured.
+
+        Returns:
+            list: A list of PySpark pipeline stages for encoding treatment features, or
+            an empty list if no bucketization.
+        """
         if not self.do_bucketize:
             return []
         treatment_ada, treatment_aap = self.getTreatments
@@ -197,6 +264,9 @@ class FeatureEngineering(HasConfigParam):
 
     @log_decorator
     def create_featurization_pipeline(self):
+        """
+        Method to create the entire featurization pipeline with all necessary transformation stages.
+        """
         stages = (
             [
                 VariableTransformer(
@@ -222,6 +292,10 @@ class FeatureEngineering(HasConfigParam):
 
     @log_decorator
     def create_featurized_data(self):
+        """
+        Method to apply the featurization pipeline to the training data, resulting in
+        a engineered dataset ready for modeling.
+        """
         mla_training_data = self.data_preprocessor.mla_training_data
         self.pipeline_model = self.featurization_pipeline.fit(mla_training_data)
         self.featurized_data = self.pipeline_model.transform(mla_training_data)
@@ -229,6 +303,11 @@ class FeatureEngineering(HasConfigParam):
 
     @property
     def get_impression_features_list(self):
+        """
+        Property to get the list of impression features that have been engineered.
+        Returns:
+            list: A list of engineered impression feature names as strings.
+        """
         return self.imp_features
 
     def get_marketing_index(self):

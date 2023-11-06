@@ -57,7 +57,7 @@ class PropensityModel:
         Return the name of the column containing feature vectors.
 
         Returns:
-        - str: Name of the features .
+            - str: Name of the features.
         """
         return self.features_col
 

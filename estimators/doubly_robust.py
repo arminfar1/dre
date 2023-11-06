@@ -269,9 +269,11 @@ class WildebeestDoublyRobustEstimation(
 
     def save_test_data(self, base_path):
         """
-
-        @param base_path:
-        @return:
+         Save the test dataframe that can be used later for scoring.
+        Parameters:
+             - base_path (str): path to write the file..
+         Returns:
+             None.
         """
         test_data_path = generate_paths(base_path, "final_test_data")
         try:
@@ -284,7 +286,7 @@ class WildebeestDoublyRobustEstimation(
         """
         Save trained models and their features importance to a specified S3 base path.
         Parameters:
-            base_path: S3 path to save the trained models.
+            - base_path: S3 path to save the trained models.
 
         Returns:
             None.

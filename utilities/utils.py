@@ -19,7 +19,7 @@ def get_config_param():
     # Now just hard coded. Could be imported from a JSON config file.
     return {
         "treatments": {"aap_num_days": 7, "ada_num_days": 7},
-        "imp_threshold": 20,
+        "imp_threshold": 5,
         "weight": True,
     }
 
@@ -140,7 +140,7 @@ def parse_uri(path):
     return uri_header, bucket_name, prefix
 
 
-def split_train_test(dataset: DataFrame, rate=0.2):
+def split_train_test(dataset: DataFrame, rate=0.1):
     train, test = dataset.randomSplit([1 - rate, rate], seed=12345)
     return train, test
 

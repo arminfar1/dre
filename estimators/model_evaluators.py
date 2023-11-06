@@ -1,11 +1,21 @@
+import logging
+
+import numpy as np
 import pyspark.sql.functions as f
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, mean as _mean
 from pyspark.sql import DataFrame
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, DoubleType
+from pyspark.sql.types import StructType, StructField, DoubleType, Row
+
+logger = logging.getLogger()
 
 
 class WildebeestDREstimationUtils:
+    """
+    Utility class for computing DRE estimates, Average Treatment Effect (ATE),
+    Average Treatment effect on the Treated (ATT), and lift for causal inference models.
+    """
+
     @staticmethod
     def _compute_doubly_robust_estimates(
         dataset: DataFrame, treatment_type: str, label_col: str = ""
@@ -100,40 +110,71 @@ class WildebeestDREstimationUtils:
         return dataset
 
     @staticmethod
-    def _bootstrap_estimation(dataset, treatment_type, num_iterations=800, att_only=False):
+    def _bootstrap_estimation(
+        dataset: DataFrame, treatment_type: str, num_iterations: int = 1000, att_only=False
+    ):
         dre_column = f"{treatment_type}_doubly_robust_estimate"
 
         if att_only:
-            dataset = dataset.filter(col(f"is_treated_by_{treatment_type}") == 0.7)
+            dataset = dataset.filter(col(f"is_treated_by_{treatment_type}") == 1)
 
-        # Initialize SparkSession
+        # Broadcast the dataset
         spark = SparkSession.builder.getOrCreate()
+        dataset_bc = spark.sparkContext.broadcast(dataset.collect())
 
-        # Create an empty DataFrame to hold bootstrap estimates
-        schema = StructType([StructField("estimate", DoubleType(), True)])
-        bootstrapped_estimates_df = spark.createDataFrame([], schema)
+        #  bootstrap function that is used in parallelization
+        def bootstrap_function(_):
+            local_dataset = dataset_bc.value
+            bootstrap_sample = [
+                local_dataset[i] for i in np.random.choice(len(local_dataset), len(local_dataset))
+            ]
+            return float(sum(row[dre_column] for row in bootstrap_sample) / len(bootstrap_sample))
 
-        for _ in range(num_iterations):
-            # Create a bootstrap sample and calculate its mean estimate
-            bootstrap_sample = dataset.sample(withReplacement=True, fraction=1.0)
-            avg_estimate_df = bootstrap_sample.agg({dre_column: "mean"}).withColumnRenamed(f"avg({dre_column})",
-                                                                                           "estimate")
+        # Parallelize the bootstrapping process
+        rdd = spark.sparkContext.parallelize(range(num_iterations))
+        bootstrapped_estimates_rdd = rdd.map(bootstrap_function)
 
-            # Union the average estimate with the bootstrapped estimates DataFrame
-            bootstrapped_estimates_df = bootstrapped_estimates_df.union(avg_estimate_df)
+        # Convert RDD to DataFrame
+        bootstrapped_estimates_df = bootstrapped_estimates_rdd.map(
+            lambda value: Row(value=value)
+        ).toDF()
 
-        # Calculate the overall average of the bootstrapped estimates
-        final_avg_estimate = bootstrapped_estimates_df.agg({"estimate": "avg"}).collect()[0][0]
+        # Calculate average using the aggregated sum and count
+        sum_count = bootstrapped_estimates_rdd.aggregate(
+            (0, 0),
+            (lambda acc, value: (acc[0] + value, acc[1] + 1)),
+            (lambda acc1, acc2: (acc1[0] + acc2[0], acc1[1] + acc2[1])),
+        )
+        avg_estimate = sum_count[0] / sum_count[1]
 
-        # Calculate the 2.5th and 97.5th percentiles of the bootstrapped estimates
-        lower_bound, upper_bound = bootstrapped_estimates_df.approxQuantile("estimate", [0.025, 0.975], 0.01)
+        # Calculate approximate percentiles using DataFrame's approxQuantile method
+        lower_bound, upper_bound = bootstrapped_estimates_df.approxQuantile(
+            "value", [0.025, 0.975], 0.01
+        )
 
-        return final_avg_estimate, (lower_bound, upper_bound)
+        return avg_estimate, (lower_bound, upper_bound)
 
     @staticmethod
-    def _calculate_ATE_and_ATT(dataset: DataFrame, treatment_type: str):
-        # select the DRE column
+    def _calculate_ATE_and_ATT(dataset: DataFrame, treatment_type: str, sample_size: int = 1500000):
+        # Important: Ensure the smaller, selected dataset is persisted in memory to optimize reuse.
+        # By persisting only the necessary columns, we reduce memory footprint  This can lead
+        # to significant performance improvements, especially when the number of bootstrap iterations is large.
+        dataset_count = dataset.count()
+        if dataset_count > sample_size:
+            # Sample the dataset to approximately 1 million rows
+            fraction = sample_size / float(dataset.count())
+            logger.warning(
+                "Test dataset has %s rows.. Sampling %s of the dataset for bootstrapping.",
+                dataset_count,
+                fraction,
+            )
+
+            dataset = dataset.sample(withReplacement=False, fraction=fraction)
+
         calculated_dre_df = dataset.select(f"{treatment_type}_doubly_robust_estimate")
+
+        # Ensure the dataset is persisted in memory
+        calculated_dre_df.persist()
 
         avg_ATE, CI_ATE = WildebeestDREstimationUtils._bootstrap_estimation(
             calculated_dre_df, treatment_type
@@ -141,6 +182,9 @@ class WildebeestDREstimationUtils:
         avg_ATT, CI_ATT = WildebeestDREstimationUtils._bootstrap_estimation(
             calculated_dre_df, treatment_type, att_only=True
         )
+
+        # Unpersist the dataset
+        calculated_dre_df.unpersist()
 
         return {
             "ATE": {"average": avg_ATE, "CI": CI_ATE},

@@ -19,6 +19,11 @@ from ..utilities.utils import HasConfigParam, hasColumn
 class VariableTransformer(
     Transformer, HasConfigParam, DefaultParamsReadable, DefaultParamsWritable
 ):
+    """
+    WARNING: Currently, I am not using any bucketizing in DRE or OLS. We need more research on using it in DRE
+    methods. I keep the method here for now.
+    """
+
     @keyword_only
     def __init__(self, configParam=None, do_bucketize=False):
         super(VariableTransformer, self).__init__()
